@@ -22,9 +22,17 @@ python3 app.py
 - `POST /api/bids`、`POST /api/bids/withdraw`、`POST /api/bids/disqualify`
 - `POST /api/tenders/open`：截止后开标并核验承诺哈希
 - `POST /api/conflicts`、`POST /api/evaluations`
-- `POST /api/clarifications`、`POST /api/clarifications/answer`
+- `POST /api/clarifications`、`POST /api/clarifications/answer`、`POST /api/clarifications/publish`
+- `POST /api/bids/confirm`：澄清版本变更后确认旧投标继续有效，或按新要求重提
+- `GET /api/bids/{id}`：供应商只能查看自己的密封投标
 - `POST /api/complaints`、`POST /api/complaints/resolve`
 - `POST /api/tenders/award`：锁定评分轮次并保存排名快照
+
+## 澄清版本与可恢复开标
+
+澄清发布采用“先登记、后整套生效”的恢复流程：同一 `clarification_no` 的问题与答复生成不可修订版本；重试相同编号和内容时只补齐未完成步骤，不会产生重复版本或重复审计。澄清版本生效后，旧版本密封投标进入待确认状态；参数实际受影响的投标必须通过 `/api/bids/confirm` 重提，未受影响的投标确认后才恢复有效。仍存在待确认或待重提投标时不能开标或评分。
+
+澄清发布与开标确认都以项目版本做乐观并发控制，并由数据库写锁串行化；后提交的一方只得到 409 版本冲突，开标结果不会半程泄露。旧数据库启动时自动补记投标的澄清版本为初始版本 1，保留 `submitted_at`，并在 `original_submitted_at` 中保留原始提交时间。
 
 ## 测试
 
