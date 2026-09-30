@@ -83,6 +83,7 @@ class ProcurementService:
                     awarded_bid_id INTEGER,
                     award_snapshot TEXT,
                     version INTEGER NOT NULL DEFAULT 1,
+                    clarification_version INTEGER NOT NULL DEFAULT 1,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -103,6 +104,8 @@ class ProcurementService:
                     price REAL NOT NULL,
                     status TEXT NOT NULL DEFAULT 'sealed',
                     version INTEGER NOT NULL DEFAULT 1,
+                    clarification_version INTEGER NOT NULL DEFAULT 1,
+                    original_submitted_at TEXT NOT NULL DEFAULT '',
                     submitted_by TEXT NOT NULL,
                     submitted_at TEXT NOT NULL,
                     opened_at TEXT,
@@ -136,12 +139,41 @@ class ProcurementService:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     tender_id INTEGER NOT NULL REFERENCES tenders(id),
                     vendor_id INTEGER REFERENCES vendors(id),
-                    question TEXT NOT NULL,
+                    clarification_no TEXT UNIQUE,
+                    question TEXT NOT NULL DEFAULT '',
                     answer TEXT,
+                    content_hash TEXT,
                     status TEXT NOT NULL DEFAULT 'pending',
+                    release_version INTEGER,
                     answered_by TEXT,
                     created_at TEXT NOT NULL,
                     answered_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS clarification_versions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tender_id INTEGER NOT NULL REFERENCES tenders(id),
+                    clarification_id INTEGER NOT NULL REFERENCES clarifications(id),
+                    clarification_no TEXT NOT NULL UNIQUE,
+                    version INTEGER NOT NULL,
+                    answer TEXT NOT NULL,
+                    affected_vendor_ids TEXT NOT NULL DEFAULT '[]',
+                    requires_resubmission INTEGER NOT NULL DEFAULT 1,
+                    content_hash TEXT NOT NULL,
+                    published_by TEXT NOT NULL,
+                    published_at TEXT NOT NULL,
+                    UNIQUE(tender_id,version)
+                );
+                CREATE TABLE IF NOT EXISTS bid_clarification_status (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    bid_id INTEGER NOT NULL REFERENCES bids(id),
+                    tender_id INTEGER NOT NULL REFERENCES tenders(id),
+                    vendor_id INTEGER NOT NULL REFERENCES vendors(id),
+                    clarification_version INTEGER NOT NULL,
+                    requires_resubmission INTEGER NOT NULL DEFAULT 1,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    resolved_at TEXT,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(bid_id,clarification_version)
                 );
                 CREATE TABLE IF NOT EXISTS complaints (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -160,18 +192,100 @@ class ProcurementService:
                     actor TEXT NOT NULL,
                     action TEXT NOT NULL,
                     details TEXT NOT NULL,
+                    event_key TEXT,
                     created_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_bids_tender ON bids(tender_id,status);
+                CREATE INDEX IF NOT EXISTS idx_bid_clarification_pending
+                    ON bid_clarification_status(tender_id,status) WHERE status='pending';
                 CREATE INDEX IF NOT EXISTS idx_eval_bid_round ON evaluations(bid_id,evaluation_round);
                 """
             )
+            self._migrate_schema(conn)
+
+    def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        def columns(table: str) -> set[str]:
+            return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+        tender_columns = columns("tenders")
+        if "clarification_version" not in tender_columns:
+            conn.execute("ALTER TABLE tenders ADD COLUMN clarification_version INTEGER NOT NULL DEFAULT 1")
+        bid_columns = columns("bids")
+        if "clarification_version" not in bid_columns:
+            conn.execute("ALTER TABLE bids ADD COLUMN clarification_version INTEGER NOT NULL DEFAULT 1")
+        if "original_submitted_at" not in bid_columns:
+            conn.execute("ALTER TABLE bids ADD COLUMN original_submitted_at TEXT NOT NULL DEFAULT ''")
+            conn.execute("UPDATE bids SET original_submitted_at=submitted_at WHERE original_submitted_at=''")
+        clarification_columns = columns("clarifications")
+        for statement in (
+            "ALTER TABLE clarifications ADD COLUMN clarification_no TEXT",
+            "ALTER TABLE clarifications ADD COLUMN content_hash TEXT",
+            "ALTER TABLE clarifications ADD COLUMN release_version INTEGER",
+        ):
+            column = statement.split("ADD COLUMN ")[1].split()[0]
+            if column not in clarification_columns:
+                conn.execute(statement)
+        timeline_columns = columns("timeline")
+        if "event_key" not in timeline_columns:
+            conn.execute("ALTER TABLE timeline ADD COLUMN event_key TEXT")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_timeline_event_key ON timeline(event_key) WHERE event_key IS NOT NULL"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bid_clarification_pending ON bid_clarification_status(tender_id,status) WHERE status='pending'"
+        )
+        published_rows = conn.execute(
+            """SELECT tender_id,id,COALESCE(answered_at,created_at) AS published_at
+               FROM clarifications WHERE status='published' ORDER BY tender_id,id"""
+        ).fetchall()
+        for row in published_rows:
+            version = conn.execute(
+                """SELECT COALESCE(MAX(version),0)+1 AS next_version
+                   FROM clarification_versions WHERE tender_id=?""",
+                (row["tender_id"],),
+            ).fetchone()["next_version"]
+            version = max(version, conn.execute(
+                "SELECT COALESCE(MAX(clarification_version),1)+1 FROM tenders WHERE id=?",
+                (row["tender_id"],),
+            ).fetchone()[0])
+            conn.execute(
+                """INSERT OR IGNORE INTO clarification_versions(
+                       tender_id,clarification_id,clarification_no,version,answer,affected_vendor_ids,
+                       requires_resubmission,content_hash,published_by,published_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (row["tender_id"], row["id"],
+                 "LEGACY-CL-%s" % row["id"], version,
+                 row["answer"] if row["answer"] is not None else "", "[]", 0,
+                 "legacy", row["answered_by"] or "legacy", row["published_at"]),
+            )
+            conn.execute(
+                """UPDATE tenders
+                   SET clarification_version=MAX(clarification_version,
+                       (SELECT version FROM clarification_versions WHERE clarification_id=?)),
+                       version=MAX(version,(SELECT version FROM clarification_versions WHERE clarification_id=?))
+                   WHERE id=?""",
+                (row["id"], row["id"], row["tender_id"]),
+            )
+            conn.execute(
+                """INSERT OR IGNORE INTO bid_clarification_status(
+                       bid_id,tender_id,vendor_id,clarification_version,requires_resubmission,status,created_at)
+                   SELECT b.id,b.tender_id,b.vendor_id,?,0,'pending',?
+                   FROM bids b
+                   WHERE b.tender_id=? AND b.status='sealed'
+                     AND b.clarification_version < ?""",
+                (version, row["published_at"], row["tender_id"], version),
+            )
+            conn.execute(
+                "UPDATE clarifications SET release_version=(SELECT version FROM clarification_versions WHERE clarification_id=?) WHERE id=?",
+                (row["id"], row["id"]),
+            )
 
     def _audit(self, conn: sqlite3.Connection, tender_id: int | None, actor: str,
-               action: str, details: dict[str, Any]) -> None:
+               action: str, details: dict[str, Any], event_key: str | None = None) -> None:
         conn.execute(
-            "INSERT INTO timeline(tender_id,actor,action,details,created_at) VALUES(?,?,?,?,?)",
-            (tender_id, actor, action, json.dumps(details, ensure_ascii=False, sort_keys=True), utcnow()),
+            "INSERT OR IGNORE INTO timeline(tender_id,actor,action,details,event_key,created_at) VALUES(?,?,?,?,?,?)",
+            (tender_id, actor, action,
+             json.dumps(details, ensure_ascii=False, sort_keys=True), event_key, utcnow()),
         )
 
     def _tender(self, conn: sqlite3.Connection, tender_id: int) -> sqlite3.Row:
@@ -179,6 +293,82 @@ class ProcurementService:
         if not row:
             raise DomainError("采购项目不存在", 404)
         return row
+
+    def _clarification_hash(self, answer: str, affected_vendor_ids: list[int],
+                            requires_resubmission: bool) -> str:
+        return canonical_hash({
+            "answer": answer,
+            "affected_vendor_ids": sorted(affected_vendor_ids),
+            "requires_resubmission": requires_resubmission,
+        })
+
+    def _normalize_vendor_ids(self, conn: sqlite3.Connection, tender_id: int,
+                              affected_vendor_ids: Any) -> list[int]:
+        if affected_vendor_ids is None:
+            return []
+        if not isinstance(affected_vendor_ids, list):
+            raise DomainError("受影响供应商必须是编号数组")
+        normalized: list[int] = []
+        for raw in affected_vendor_ids:
+            try:
+                vendor_id = int(raw)
+            except (TypeError, ValueError) as exc:
+                raise DomainError("供应商编号无效") from exc
+            if vendor_id not in normalized:
+                normalized.append(vendor_id)
+        placeholders = ",".join("?" for _ in normalized)
+        if normalized:
+            found = {
+                row["id"]
+                for row in conn.execute(
+                    f"SELECT id FROM vendors WHERE id IN ({placeholders})", normalized
+                ).fetchall()
+            }
+            missing = sorted(set(normalized) - found)
+            if missing:
+                raise DomainError("受影响供应商不存在: %s" % ",".join(map(str, missing)), 404)
+        return normalized
+
+    def _invalidate_bids(self, conn: sqlite3.Connection, tender_id: int, clarification_version: int,
+                         affected_vendor_ids: list[int], requires_resubmission: bool,
+                         published_at: str) -> list[int]:
+        rows = conn.execute(
+            """SELECT id,vendor_id FROM bids
+               WHERE tender_id=? AND status='sealed' AND clarification_version<?""",
+            (tender_id, clarification_version),
+        ).fetchall()
+        affected_set = set(affected_vendor_ids)
+        bid_ids: list[int] = []
+        now = utcnow()
+        for bid in rows:
+            requires = 1 if (not affected_vendor_ids or bid["vendor_id"] in affected_set) and requires_resubmission else 0
+            conn.execute(
+                """INSERT OR IGNORE INTO bid_clarification_status
+                   (bid_id,tender_id,vendor_id,clarification_version,requires_resubmission,status,created_at)
+                   VALUES(?,?,?,?,?,'pending',?)""",
+                (bid["id"], tender_id, bid["vendor_id"], clarification_version, requires, published_at),
+            )
+            conn.execute(
+                """INSERT OR IGNORE INTO timeline(tender_id,actor,action,details,event_key,created_at)
+                   VALUES(?,?,?,?,?,?)""",
+                (
+                    tender_id, "system", "clarification.bid_invalidated",
+                    json.dumps({"bid_id": bid["id"], "clarification_version": clarification_version,
+                                "requires_resubmission": bool(requires)}, ensure_ascii=False,
+                               sort_keys=True),
+                    f"clarification-{clarification_version}-bid-{bid['id']}", now,
+                ),
+            )
+            bid_ids.append(bid["id"])
+        return bid_ids
+
+    def _pending_clarification_count(self, conn: sqlite3.Connection, tender_id: int) -> int:
+        return conn.execute(
+            """SELECT COUNT(*) AS c
+               FROM bid_clarification_status s JOIN bids b ON b.id=s.bid_id
+               WHERE s.tender_id=? AND s.status='pending' AND b.status='sealed'""",
+            (tender_id,),
+        ).fetchone()["c"]
 
     def create_vendor(self, actor: str, role: str, vendor_no: str, name: str,
                       representative: str) -> dict[str, Any]:
@@ -275,7 +465,23 @@ class ProcurementService:
                 raise DomainError("供应商不存在", 404)
             if not conn.execute("SELECT 1 FROM conflicts WHERE tender_id=? AND vendor_id=? AND evaluator=?", (tender_id, vendor_id, actor)).fetchone():
                 pass
-            existing = conn.execute("SELECT * FROM bids WHERE tender_id=? AND vendor_id=?", (tender_id, vendor_id)).fetchone()
+            existing = conn.execute(
+                "SELECT * FROM bids WHERE tender_id=? AND vendor_id=?", (tender_id, vendor_id)
+            ).fetchone()
+            now = utcnow()
+            pending = []
+            if existing:
+                pending = conn.execute(
+                    "SELECT * FROM bid_clarification_status WHERE bid_id=? AND status='pending' ORDER BY clarification_version",
+                    (existing["id"],),
+                ).fetchall()
+                only_confirmation = pending and not any(row["requires_resubmission"] for row in pending)
+                if only_confirmation:
+                    raise DomainError("澄清后该投标只需确认，不能直接重提", 409)
+                if existing["clarification_version"] < tender["clarification_version"] and not any(
+                    row["requires_resubmission"] for row in pending
+                ):
+                    raise DomainError("投标对应澄清版本已过期，请先确认", 409)
             payload_text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
             digest = canonical_hash(payload)
             if existing:
@@ -284,16 +490,26 @@ class ProcurementService:
                 if expected_version is None or existing["version"] != int(expected_version):
                     raise DomainError("投标已变化，请刷新后重试", 409)
                 conn.execute(
-                    "UPDATE bids SET payload=?,payload_hash=?,price=?,version=version+1,submitted_at=? WHERE id=? AND version=?",
-                    (payload_text, digest, price, utcnow(), existing["id"], expected_version),
+                    """UPDATE bids
+                       SET payload=?,payload_hash=?,price=?,version=version+1,clarification_version=?,submitted_at=?
+                       WHERE id=? AND version=?""",
+                    (payload_text, digest, price, tender["clarification_version"], now,
+                     existing["id"], expected_version),
                 )
+                if pending:
+                    conn.execute(
+                        "UPDATE bid_clarification_status SET status='resolved',resolved_at=? WHERE bid_id=? AND status='pending'",
+                        (now, existing["id"]),
+                    )
                 bid_id = existing["id"]
-                action = "bid.updated"
+                action = "bid.resubmitted" if pending else "bid.updated"
             else:
                 cur = conn.execute(
-                    """INSERT INTO bids(tender_id,vendor_id,payload,payload_hash,price,submitted_by,submitted_at)
-                       VALUES(?,?,?,?,?,?,?)""",
-                    (tender_id, vendor_id, payload_text, digest, price, actor, utcnow()),
+                    """INSERT INTO bids(tender_id,vendor_id,payload,payload_hash,price,clarification_version,
+                                        original_submitted_at,submitted_by,submitted_at)
+                       VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (tender_id, vendor_id, payload_text, digest, price,
+                     tender["clarification_version"], now, actor, now),
                 )
                 bid_id = cur.lastrowid
                 action = "bid.submitted"
@@ -321,6 +537,47 @@ class ProcurementService:
             self._audit(conn, bid["tender_id"], actor, "bid.withdrawn", {"bid_id": bid_id})
             return dict(conn.execute("SELECT * FROM bids WHERE id=?", (bid_id,)).fetchone())
 
+    def confirm_bid(self, actor: str, role: str, bid_id: int, expected_version: int) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"vendor"}, "确认投标")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            bid = conn.execute("SELECT * FROM bids WHERE id=?", (bid_id,)).fetchone()
+            if not bid:
+                raise DomainError("投标不存在", 404)
+            tender = self._tender(conn, bid["tender_id"])
+            if bid["submitted_by"] != actor:
+                raise DomainError("只能确认自己的投标", 403)
+            if tender["status"] != "published" or datetime.now(timezone.utc) >= parse_time(tender["deadline"]):
+                raise DomainError("当前投标不能确认", 409)
+            if bid["status"] != "sealed":
+                raise DomainError("只有密封投标可以确认", 409)
+            if bid["version"] != int(expected_version):
+                raise DomainError("投标已变化，请刷新后重试", 409)
+            pending = conn.execute(
+                "SELECT * FROM bid_clarification_status WHERE bid_id=? AND status='pending' ORDER BY clarification_version",
+                (bid_id,),
+            ).fetchall()
+            if not pending:
+                raise DomainError("没有待确认的澄清版本", 409)
+            must_resubmit = [row["clarification_version"] for row in pending if row["requires_resubmission"]]
+            if must_resubmit:
+                raise DomainError("澄清版本 %s 要求重新提交投标" % ",".join(map(str, must_resubmit)), 409)
+            now = utcnow()
+            conn.execute(
+                "UPDATE bids SET clarification_version=?,version=version+1 WHERE id=? AND version=?",
+                (tender["clarification_version"], bid_id, expected_version),
+            )
+            conn.execute(
+                "UPDATE bid_clarification_status SET status='confirmed',resolved_at=? WHERE bid_id=? AND status='pending'",
+                (now, bid_id),
+            )
+            self._audit(conn, bid["tender_id"], actor, "bid.confirmed",
+                        {"bid_id": bid_id, "clarification_version": tender["clarification_version"]})
+            return dict(conn.execute("SELECT * FROM bids WHERE id=?", (bid_id,)).fetchone())
+
+    reconfirm_bid = confirm_bid
+
     def open_bids(self, actor: str, role: str, tender_id: int, expected_version: int) -> dict[str, Any]:
         actor = clean_actor(actor)
         require_role(role, {"procurement", "supervisor"}, "开标")
@@ -333,13 +590,23 @@ class ProcurementService:
                 raise DomainError("项目已变化，请刷新后重试", 409)
             if datetime.now(timezone.utc) < parse_time(tender["deadline"]):
                 raise DomainError("尚未到开标时间", 409)
-            rows = conn.execute("SELECT * FROM bids WHERE tender_id=? AND status='sealed' ORDER BY id", (tender_id,)).fetchall()
-            opened = []
-            now = utcnow()
+            pending_count = self._pending_clarification_count(conn, tender_id)
+            if pending_count:
+                raise DomainError("仍有投标未确认或未按最新澄清重提，不能开标", 409)
+            rows = conn.execute(
+                "SELECT * FROM bids WHERE tender_id=? AND status='sealed' ORDER BY id", (tender_id,)
+            ).fetchall()
+            validated = []
             for row in rows:
                 digest = canonical_hash(json.loads(row["payload"]))
                 if digest != row["payload_hash"]:
                     raise DomainError("投标完整性校验失败: %s" % row["id"], 409)
+                if row["clarification_version"] < tender["clarification_version"]:
+                    raise DomainError("投标 %s 不是最新澄清版本，不能开标" % row["id"], 409)
+                validated.append((row, digest))
+            opened = []
+            now = utcnow()
+            for row, _digest in validated:
                 conn.execute("UPDATE bids SET status='opened',opened_at=?,version=version+1 WHERE id=?", (now, row["id"]))
                 opened.append(dict(conn.execute("SELECT * FROM bids WHERE id=?", (row["id"],)).fetchone()))
             conn.execute("UPDATE tenders SET status='opened',version=version+1,updated_at=? WHERE id=?", (now, tender_id))
@@ -450,24 +717,232 @@ class ProcurementService:
             self._audit(conn, tender_id, actor, "clarification.asked", {"clarification_id": cur.lastrowid})
             return dict(conn.execute("SELECT * FROM clarifications WHERE id=?", (cur.lastrowid,)).fetchone())
 
+    def _publish_clarification(self, conn: sqlite3.Connection, actor: str, tender_id: int,
+                               clarification_no: str, answer: str,
+                               affected_vendor_ids: list[int] | None = None,
+                               requires_resubmission: bool = True,
+                               expected_version: int | None = None,
+                               clarification_id: int | None = None,
+                               question: str = "", vendor_id: int | None = None) -> dict[str, Any]:
+        tender = self._tender(conn, tender_id)
+        normalized_answer = answer.strip()
+        normalized_no = clarification_no.strip()
+        affected = self._normalize_vendor_ids(conn, tender_id, affected_vendor_ids)
+        digest = self._clarification_hash(normalized_answer, affected, requires_resubmission)
+        existing_version = conn.execute(
+            "SELECT * FROM clarification_versions WHERE clarification_no=?", (normalized_no,)
+        ).fetchone()
+        existing_clarification = None
+        if clarification_id is not None:
+            existing_clarification = conn.execute(
+                "SELECT * FROM clarifications WHERE id=?", (clarification_id,)
+            ).fetchone()
+        else:
+            existing_clarification = conn.execute(
+                "SELECT * FROM clarifications WHERE clarification_no=? AND release_version IS NULL AND status='pending'",
+                (normalized_no,),
+            ).fetchone()
+        if existing_version:
+            if existing_version["tender_id"] != tender_id or existing_version["content_hash"] != digest:
+                raise DomainError("澄清编号已存在且不可修订；如已变更请使用新编号", 409)
+            existing_clarification = conn.execute(
+                "SELECT * FROM clarifications WHERE id=?", (existing_version["clarification_id"],)
+            ).fetchone()
+        elif existing_clarification:
+            if existing_clarification["tender_id"] != tender_id:
+                raise DomainError("澄清不存在", 404)
+            if clarification_id is None and existing_clarification["clarification_no"] != normalized_no:
+                raise DomainError("澄清编号与既有记录不一致", 409)
+            stored_hash = existing_clarification["content_hash"]
+            if stored_hash and stored_hash != digest:
+                raise DomainError("澄清编号已存在且不可修订；如已变更请使用新编号", 409)
+        recovering = bool(existing_version) or (
+            existing_clarification is not None and existing_clarification["release_version"] is not None
+        )
+        if not recovering and expected_version is not None and tender["version"] != int(expected_version):
+            raise DomainError("项目版本冲突，请刷新后重试", 409)
+        if tender["status"] != "published":
+            raise DomainError("只有投标中的项目可以发布澄清", 409)
+        if datetime.now(timezone.utc) >= parse_time(tender["deadline"]):
+            raise DomainError("投标截止后不能发布澄清", 409)
+        replayed = False
+        repaired = False
+        if existing_version:
+            replayed = True
+            new_version = int(existing_version["version"])
+            published_at = existing_version["published_at"]
+        elif existing_clarification is not None and existing_clarification["release_version"] is not None:
+            replayed = True
+            new_version = max(
+                int(existing_clarification["release_version"]),
+                tender["clarification_version"] + 1,
+            )
+            published_at = existing_clarification["answered_at"] or utcnow()
+        else:
+            new_version = max(tender["clarification_version"] + 1, 2)
+            published_at = utcnow()
+        if existing_clarification is None:
+            try:
+                cur = conn.execute(
+                    """INSERT INTO clarifications(tender_id,vendor_id,clarification_no,question,answer,
+                                                  content_hash,status,release_version,answered_by,created_at,answered_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (tender_id, vendor_id, normalized_no, question, normalized_answer, digest,
+                     "published", new_version, actor, published_at, published_at),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DomainError("澄清编号已存在且不可修订；如已变更请使用新编号", 409) from exc
+            clarification_id = cur.lastrowid
+            if recovering:
+                repaired = True
+        else:
+            clarification_id = existing_clarification["id"]
+            stored_publisher = existing_clarification["answered_by"] or actor
+        if not existing_version:
+            conn.execute(
+                """INSERT OR IGNORE INTO clarification_versions(tender_id,clarification_id,clarification_no,version,answer,
+                                                      affected_vendor_ids,requires_resubmission,content_hash,
+                                                      published_by,published_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (tender_id, clarification_id, normalized_no, new_version, normalized_answer,
+                 json.dumps(affected, ensure_ascii=False), 1 if requires_resubmission else 0, digest,
+                 actor, published_at),
+            )
+            if recovering:
+                repaired = True
+        elif existing_version["clarification_id"] != clarification_id:
+            conn.execute(
+                "UPDATE clarification_versions SET clarification_id=? WHERE id=?",
+                (clarification_id, existing_version["id"]),
+            )
+            repaired = True
+        if existing_clarification is not None:
+            conn.execute(
+                """UPDATE clarifications
+                   SET clarification_no=?,answer=COALESCE(answer,?),content_hash=COALESCE(content_hash,?),
+                       status='published',release_version=?,answered_by=COALESCE(answered_by,?),answered_at=?
+                   WHERE id=?""",
+                (normalized_no, normalized_answer, digest, new_version, stored_publisher,
+                 published_at, clarification_id),
+            )
+            if recovering and (
+                existing_clarification["release_version"] is None
+                or existing_clarification["status"] != "published"
+                or existing_clarification["content_hash"] is None
+            ):
+                repaired = True
+        if tender["clarification_version"] < new_version:
+            conn.execute(
+                """UPDATE tenders
+                   SET clarification_version=?,version=MAX(version, ?)+1,updated_at=?
+                   WHERE id=?""",
+                (new_version, new_version, published_at if not replayed else utcnow(), tender_id),
+            )
+            if replayed:
+                repaired = True
+        root_event_key = f"clarification-published-{normalized_no}"
+        root_missing = conn.execute(
+            "SELECT 1 FROM timeline WHERE event_key=?", (root_event_key,)
+        ).fetchone() is None
+        if root_missing and recovering:
+            repaired = True
+        before_status = {
+            (row["bid_id"], row["clarification_version"]): row["status"]
+            for row in conn.execute(
+                "SELECT bid_id,clarification_version,status FROM bid_clarification_status WHERE clarification_version=?",
+                (new_version,),
+            ).fetchall()
+        }
+        eligible_rows = conn.execute(
+            """SELECT id FROM bids
+               WHERE tender_id=? AND status='sealed' AND clarification_version<?""",
+            (tender_id, new_version),
+        ).fetchall()
+        missing_invalidation_audit = [
+            row["id"]
+            for row in eligible_rows
+            if not conn.execute(
+                "SELECT 1 FROM timeline WHERE event_key=?",
+                (f"clarification-{new_version}-bid-{row['id']}",),
+            ).fetchone()
+        ]
+        affected_bid_ids = self._invalidate_bids(
+            conn, tender_id, new_version, affected, requires_resubmission, published_at
+        )
+        after_rows = conn.execute(
+            "SELECT bid_id,status FROM bid_clarification_status WHERE clarification_version=?",
+            (new_version,),
+        ).fetchall()
+        status_repaired = any(
+            before_status.get((row["bid_id"], new_version)) != row["status"]
+            for row in after_rows
+        )
+        repaired = repaired or status_repaired or bool(missing_invalidation_audit) or (root_missing and recovering)
+        clarification = conn.execute(
+            "SELECT * FROM clarifications WHERE id=?", (existing_version["clarification_id"] if existing_version else clarification_id,),
+        ).fetchone()
+        version = dict(conn.execute(
+            "SELECT * FROM clarification_versions WHERE clarification_no=?", (normalized_no,)
+        ).fetchone())
+        version["affected_vendor_ids"] = json.loads(version["affected_vendor_ids"])
+        version["requires_resubmission"] = bool(version["requires_resubmission"])
+        self._audit(
+            conn, tender_id, actor, "clarification.published",
+            {"clarification_no": normalized_no, "version": new_version,
+             "affected_bid_ids": affected_bid_ids, "replayed": replayed, "repaired": repaired},
+            f"clarification-published-{normalized_no}",
+        )
+        result = {"clarification": dict(clarification), "version": version,
+                  "affected_bid_ids": affected_bid_ids, "replayed": replayed,
+                  "repaired": repaired, "tender": dict(self._tender(conn, tender_id))}
+        return result
+
+    def publish_clarification(self, actor: str, role: str, tender_id: int, clarification_no: str,
+                              answer: str, affected_vendor_ids: list[int] | None = None,
+                              requires_resubmission: bool = True,
+                              expected_version: int | None = None) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"procurement", "supervisor"}, "发布澄清")
+        if not clarification_no.strip():
+            raise DomainError("澄清编号不能为空")
+        if not answer.strip():
+            raise DomainError("澄清答复不能为空")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            return self._publish_clarification(
+                conn, actor, tender_id, clarification_no, answer, affected_vendor_ids,
+                requires_resubmission, expected_version,
+            )
+
     def answer_clarification(self, actor: str, role: str, clarification_id: int,
-                             answer: str, publish: bool = True) -> dict[str, Any]:
+                             answer: str, publish: bool = True, clarification_no: str | None = None,
+                             affected_vendor_ids: list[int] | None = None,
+                             requires_resubmission: bool = True,
+                             expected_version: int | None = None) -> dict[str, Any]:
         actor = clean_actor(actor)
         require_role(role, {"procurement", "supervisor"}, "答复澄清")
         if not answer.strip():
             raise DomainError("澄清答复不能为空")
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT * FROM clarifications WHERE id=?", (clarification_id,)).fetchone()
             if not row:
                 raise DomainError("澄清不存在", 404)
+            if publish:
+                number = clarification_no or row["clarification_no"] or "CL-%s" % clarification_id
+                return self._publish_clarification(
+                    conn, actor, row["tender_id"], number, answer, affected_vendor_ids,
+                    requires_resubmission, expected_version, clarification_id=clarification_id,
+                    question=row["question"], vendor_id=row["vendor_id"],
+                )
             if row["status"] != "pending":
                 raise DomainError("澄清已经处理", 409)
-            status = "published" if publish else "answered"
             conn.execute(
-                "UPDATE clarifications SET answer=?,status=?,answered_by=?,answered_at=? WHERE id=?",
-                (answer.strip(), status, actor, utcnow(), clarification_id),
+                "UPDATE clarifications SET answer=?,status='answered',answered_by=?,answered_at=? WHERE id=?",
+                (answer.strip(), actor, utcnow(), clarification_id),
             )
-            self._audit(conn, row["tender_id"], actor, "clarification.answered", {"clarification_id": clarification_id, "published": publish})
+            self._audit(conn, row["tender_id"], actor, "clarification.answered",
+                        {"clarification_id": clarification_id, "published": False})
             return dict(conn.execute("SELECT * FROM clarifications WHERE id=?", (clarification_id,)).fetchone())
 
     def submit_complaint(self, actor: str, role: str, tender_id: int, body: str) -> dict[str, Any]:
@@ -556,43 +1031,99 @@ class ProcurementService:
             self._audit(conn, tender_id, actor, "tender.awarded", {"winner": winner, "ranking": ranking})
             return {"tender": dict(self._tender(conn, tender_id)), "award": snapshot}
 
+    def _bid_view(self, conn: sqlite3.Connection, bid: sqlite3.Row, actor: str, role: str,
+                  tender: sqlite3.Row | None = None) -> dict[str, Any]:
+        tender = tender or self._tender(conn, bid["tender_id"])
+        item = dict(bid)
+        is_owner = role == "vendor" and bid["submitted_by"] == actor
+        is_manager = role in {"procurement", "supervisor", "auditor"}
+        is_evaluator = role == "evaluator"
+        if not (is_owner or is_manager or is_evaluator):
+            raise DomainError("无权查看该投标", 403)
+        if role == "vendor" and not is_owner:
+            raise DomainError("无权查看其他供应商的投标", 403)
+        opened = tender["status"] in {"opened", "reevaluation", "awarded"}
+        if not opened:
+            item.pop("payload", None)
+        statuses = [dict(r) for r in conn.execute(
+            "SELECT * FROM bid_clarification_status WHERE bid_id=? ORDER BY clarification_version",
+            (bid["id"],),
+        ).fetchall()]
+        for status in statuses:
+            status["requires_resubmission"] = bool(status["requires_resubmission"])
+        item["clarification_status"] = statuses
+        return item
+
+    def get_bid(self, actor: str, role: str, bid_id: int) -> dict[str, Any]:
+        with self.connect() as conn:
+            bid = conn.execute("SELECT * FROM bids WHERE id=?", (bid_id,)).fetchone()
+            if not bid:
+                raise DomainError("投标不存在", 404)
+            tender = self._tender(conn, bid["tender_id"])
+            return self._bid_view(conn, bid, actor, role, tender)
+
     def get_tender(self, actor: str, role: str, tender_id: int) -> dict[str, Any]:
         with self.connect() as conn:
             tender = dict(self._tender(conn, tender_id))
             bids = []
-            if role in {"procurement", "supervisor", "auditor"} and tender["status"] in {"opened", "reevaluation", "awarded"}:
-                bids = [dict(r) for r in conn.execute("SELECT * FROM bids WHERE tender_id=? ORDER BY id", (tender_id,)).fetchall()]
-            elif role == "vendor":
+            if role in {"procurement", "supervisor", "auditor"}:
+                rows = conn.execute("SELECT * FROM bids WHERE tender_id=? ORDER BY id", (tender_id,)).fetchall()
                 bids = []
-                for row in conn.execute(
-                    "SELECT b.*,t.status AS tender_status FROM bids b JOIN tenders t ON t.id=b.tender_id WHERE b.tender_id=? AND b.submitted_by=?",
-                    (tender_id, actor),
-                ).fetchall():
+                opened = tender["status"] in {"opened", "reevaluation", "awarded"}
+                for row in rows:
                     item = dict(row)
-                    item.pop("tender_status", None)
-                    if tender["status"] not in {"opened", "reevaluation", "awarded"}:
+                    if not opened:
                         item.pop("payload", None)
+                    item["clarification_status"] = [
+                        dict(status, requires_resubmission=bool(status["requires_resubmission"]))
+                        for status in conn.execute(
+                            "SELECT * FROM bid_clarification_status WHERE bid_id=? ORDER BY clarification_version",
+                            (row["id"],),
+                        ).fetchall()
+                    ]
                     bids.append(item)
+            elif role == "vendor":
+                bids = [
+                    self._bid_view(conn, row, actor, role, conn.execute(
+                        "SELECT * FROM tenders WHERE id=?", (tender_id,)
+                    ).fetchone())
+                    for row in conn.execute(
+                        "SELECT * FROM bids WHERE tender_id=? AND submitted_by=? ORDER BY id",
+                        (tender_id, actor),
+                    ).fetchall()
+                ]
             else:
                 bids = [dict(r) for r in conn.execute(
-                    "SELECT id,tender_id,vendor_id,price,status,payload_hash,submitted_at,opened_at FROM bids WHERE tender_id=? ORDER BY id",
+                    """SELECT id,tender_id,vendor_id,price,status,version,clarification_version,payload_hash,
+                             original_submitted_at,submitted_at,opened_at
+                      FROM bids WHERE tender_id=? ORDER BY id""",
                     (tender_id,),
                 ).fetchall()]
             clarifications = [dict(r) for r in conn.execute(
-                "SELECT id,tender_id,vendor_id,question,answer,status,answered_at FROM clarifications WHERE tender_id=? AND status='published' ORDER BY id",
+                """SELECT c.id,c.tender_id,c.vendor_id,c.clarification_no,c.question,c.answer,c.status,
+                          c.release_version,c.answered_at,v.version,v.affected_vendor_ids,v.requires_resubmission,
+                          v.published_at
+                   FROM clarifications c JOIN clarification_versions v ON v.clarification_id=c.id
+                   WHERE c.tender_id=? AND c.status='published' ORDER BY v.version""",
                 (tender_id,),
             ).fetchall()]
+            for item in clarifications:
+                item["affected_vendor_ids"] = json.loads(item["affected_vendor_ids"])
+                item["requires_resubmission"] = bool(item["requires_resubmission"])
+                if role not in {"procurement", "supervisor", "auditor"}:
+                    item.pop("affected_vendor_ids", None)
             return {"tender": tender, "bids": bids, "clarifications": clarifications}
 
     def state(self, actor: str = "", role: str = "public") -> dict[str, Any]:
         with self.connect() as conn:
             tenders = [dict(r) for r in conn.execute(
-                "SELECT id,tender_no,title,description,status,deadline,evaluation_round,version,awarded_bid_id,created_at,updated_at FROM tenders ORDER BY id DESC"
+                "SELECT id,tender_no,title,description,status,deadline,evaluation_round,version,clarification_version,awarded_bid_id,created_at,updated_at FROM tenders ORDER BY id DESC"
             ).fetchall()]
             timeline = [dict(r) for r in conn.execute("SELECT * FROM timeline ORDER BY id DESC LIMIT 200").fetchall()]
             if role in {"procurement", "supervisor", "auditor"}:
                 bids = [dict(r) for r in conn.execute(
-                    """SELECT b.id,b.tender_id,b.vendor_id,b.price,b.status,b.payload_hash,b.submitted_at,b.opened_at,
+                    """SELECT b.id,b.tender_id,b.vendor_id,b.price,b.status,b.version,b.clarification_version,
+                              b.payload_hash,b.original_submitted_at,b.submitted_at,b.opened_at,
                               CASE WHEN t.status IN ('opened','reevaluation','awarded') THEN b.payload ELSE NULL END AS payload
                        FROM bids b JOIN tenders t ON t.id=b.tender_id ORDER BY b.id DESC LIMIT 200"""
                 ).fetchall()]
@@ -676,6 +1207,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._send(200, {"status": "ok", "service": "public-procurement"})
             elif path == "/api/state":
                 self._send(200, self.service.state(actor, role))
+            elif path.startswith("/api/bids/"):
+                self._send(200, self.service.get_bid(actor, role, int(path.split("/")[3])))
             elif path.startswith("/api/tenders/"):
                 self._send(200, self.service.get_tender(actor, role, int(path.split("/")[3])))
             else:
@@ -696,6 +1229,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.publish_tender(actor, role, **data)
             elif path == "/api/bids":
                 result = self.service.submit_bid(actor, role, **data)
+            elif path in {"/api/bids/confirm", "/api/bids/reconfirm"}:
+                result = self.service.confirm_bid(actor, role, **data)
             elif path == "/api/bids/withdraw":
                 result = self.service.withdraw_bid(actor, role, **data)
             elif path == "/api/tenders/open":
@@ -706,8 +1241,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.evaluate_bid(actor, role, **data)
             elif path == "/api/bids/disqualify":
                 result = self.service.disqualify_bid(actor, role, **data)
+            elif path.startswith("/api/bids/"):
+                raise DomainError("接口不存在", 404)
             elif path == "/api/clarifications":
                 result = self.service.ask_clarification(actor, role, **data)
+            elif path == "/api/clarifications/publish":
+                result = self.service.publish_clarification(actor, role, **data)
             elif path == "/api/clarifications/answer":
                 result = self.service.answer_clarification(actor, role, **data)
             elif path == "/api/complaints":
